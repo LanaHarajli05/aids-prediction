@@ -1,4 +1,229 @@
-streamlit
-pandas
-plotly
-openpyxl
+# app.py
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+from pathlib import Path
+
+st.set_page_config(page_title="Diploma Forecast", layout="wide")
+st.title("AI & DS – Forecast Dashboard")
+
+BASE = Path(__file__).parent
+
+# ---------- helpers ----------
+def read_csv_safe(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        st.error(f"Missing file: {path.name}.")
+        st.stop()
+    try:
+        return pd.read_csv(path)
+    except Exception as e:
+        st.error(f"Could not read {path.name}: {e}")
+        st.stop()
+
+def coerce_sem_date(df: pd.DataFrame, possible_cols=("sem_date", "ds", "date", "semester")) -> pd.DataFrame:
+    # Find the date/semester column; rename to sem_date and parse
+    col = next((c for c in possible_cols if c in df.columns), None)
+    if col is None:
+        st.error(f"No date/semester column found in {list(df.columns)}; expected one of {possible_cols}.")
+        st.stop()
+    if col != "sem_date":
+        df = df.rename(columns={col: "sem_date"})
+    df["sem_date"] = pd.to_datetime(df["sem_date"], errors="coerce")
+    if df["sem_date"].isna().all():
+        st.error("Could not parse any 'sem_date' values as dates.")
+        st.stop()
+    return df
+
+def ensure_columns(df: pd.DataFrame, required: dict) -> pd.DataFrame:
+    """required: {canonical_name: [aliases,...]}"""
+    rename_map = {}
+    for want, aliases in required.items():
+        found = next((c for c in [want] + aliases if c in df.columns), None)
+        if not found:
+            st.error(f"Missing column '{want}' (aliases tried: {aliases}). Columns: {list(df.columns)}")
+            st.stop()
+        if found != want:
+            rename_map[found] = want
+    return df.rename(columns=rename_map) if rename_map else df
+
+def pick_forecast_file():
+    p_prophet = BASE / "forecast_prophet.csv"
+    p_linear  = BASE / "forecast_linear.csv"
+    if p_prophet.exists():
+        return p_prophet, "prophet"
+    if p_linear.exists():
+        return p_linear, "linear"
+    st.error("No forecast CSV found. Add 'forecast_prophet.csv' or 'forecast_linear.csv' to the repo root.")
+    st.stop()
+
+def detect_country_col(df: pd.DataFrame) -> str:
+    for c in ["COR", "Country", "Country of Residence", "country", "Country_of_Residence"]:
+        if c in df.columns:
+            return c
+    # fallback: first object column that is not sem_date
+    for c in df.columns:
+        if c != "sem_date" and df[c].dtype == "object":
+            return c
+    st.error("Could not detect the country column in COR forecast file.")
+    st.stop()
+
+def std_country(series: pd.Series) -> pd.Series:
+    # Normalize common variants to stable display names
+    s = series.astype(str).str.strip().str.upper()
+    mapping = {
+        "LEBANON": "Lebanon",
+        "UAE": "UAE",
+        "UNITED ARAB EMIRATES": "UAE",
+        "EMIRATES": "UAE",
+        "KSA": "Saudi Arabia",
+        "SAUDI ARABIA": "Saudi Arabia",
+        "QATAR": "Qatar",
+        "KUWAIT": "Kuwait",
+        "USA": "USA",
+        "UNITED STATES": "USA",
+    }
+    out = s.map(mapping).fillna(s.str.title())
+    return out
+
+# ---------- load data (root) ----------
+actual_path = BASE / "actual_enrollments.csv"
+cor_path    = BASE / "forecast_cor.csv"
+fc_path, fc_kind = pick_forecast_file()
+
+actual = read_csv_safe(actual_path)
+fc     = read_csv_safe(fc_path)
+cor    = read_csv_safe(cor_path)
+
+# actuals: standardize and sort
+actual = coerce_sem_date(actual)
+actual = ensure_columns(actual, {"enrollments": ["count", "total", "Enrollments"]})
+actual = actual[["sem_date", "enrollments"]].sort_values("sem_date")
+
+# forecast: standardize columns for prophet/linear and sort
+fc = coerce_sem_date(fc)
+if fc_kind == "prophet":
+    if "yhat" not in fc.columns and "pred_total" in fc.columns:
+        fc = fc.rename(columns={"pred_total": "yhat"})
+    if "yhat" not in fc.columns and "pred_linear" in fc.columns:
+        fc = fc.rename(columns={"pred_linear": "yhat"})
+else:
+    if "pred_linear" in fc.columns and "yhat" not in fc.columns:
+        fc = fc.rename(columns={"pred_linear": "yhat"})
+if "yhat" not in fc.columns:
+    st.error(f"Forecast file missing 'yhat'. Columns: {list(fc.columns)}")
+    st.stop()
+if "yhat_lower" not in fc.columns: fc["yhat_lower"] = np.nan
+if "yhat_upper" not in fc.columns: fc["yhat_upper"] = np.nan
+fc = fc[["sem_date", "yhat", "yhat_lower", "yhat_upper"]].sort_values("sem_date")
+
+# COR forecast: standardize, deduplicate by country+semester
+cor = coerce_sem_date(cor)
+country_col = detect_country_col(cor)
+if "pred_count" not in cor.columns:
+    # try compute from proportions
+    if "pred_total" in cor.columns and ("prop_smooth" in cor.columns or "prop" in cor.columns):
+        prop_col = "prop_smooth" if "prop_smooth" in cor.columns else "prop"
+        cor["pred_count"] = (cor["pred_total"] * cor[prop_col]).round().astype("Int64")
+    else:
+        st.error("COR CSV missing 'pred_count' (and cannot compute from 'pred_total' * 'prop').")
+        st.stop()
+
+cor = cor[["sem_date", country_col, "pred_count"]].copy()
+cor["Country"] = std_country(cor[country_col])
+cor = (cor.groupby(["sem_date", "Country"], as_index=False)["pred_count"]
+          .sum()
+          .sort_values(["sem_date", "pred_count"], ascending=[True, False]))
+
+# headline total from the raw Excel (shows 425 even if time-series dropped rows)
+excel_file = BASE / "AI & DS Enrolled Students Course .xlsx"
+true_total = None
+if excel_file.exists():
+    try:
+        raw = pd.read_excel(excel_file, sheet_name="All Enrolled")
+        true_total = int(len(raw))
+    except Exception:
+        true_total = None
+
+# ---------- UI ----------
+tab1, tab2 = st.tabs(["Enrollments Forecast", "COR Forecast"])
+
+# ===== TAB 1: Enrollments =====
+with tab1:
+    st.metric("Actual Total Enrollments", int(true_total) if true_total else int(actual["enrollments"].sum()))
+
+    # Plot Actual vs Forecast with a semester range control
+    plot_df = pd.concat([
+        actual.rename(columns={"enrollments": "value"})
+              .assign(kind="Actual")[["sem_date", "value", "kind"]],
+        fc.rename(columns={"yhat": "value"})[["sem_date", "value"]]
+          .assign(kind="Forecast")
+    ], ignore_index=True)
+
+    all_sems = sorted(plot_df["sem_date"].unique())
+    if all_sems:
+        default_range = (all_sems[0], all_sems[-1])
+        sem_range = st.select_slider(
+            "Show range",
+            options=all_sems,
+            value=default_range,
+            format_func=lambda d: pd.to_datetime(d).strftime("%b %Y"),
+        )
+        mask = (plot_df["sem_date"] >= sem_range[0]) & (plot_df["sem_date"] <= sem_range[1])
+        fig = px.line(plot_df[mask], x="sem_date", y="value", color="kind", markers=True,
+                      title="Actual vs. Forecasted Enrollments")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No data available for plotting.")
+
+    # Single target semester headline + compact next-4 table
+    last_actual = actual["sem_date"].max() if not actual.empty else None
+    future_only = fc[fc["sem_date"] > last_actual] if last_actual is not None else fc.copy()
+
+    if not future_only.empty:
+        target_sem = st.selectbox(
+            "Target semester",
+            list(future_only["sem_date"]),
+            format_func=lambda d: pd.to_datetime(d).strftime("%b %Y"),
+        )
+        target_val = int(future_only.loc[future_only["sem_date"] == target_sem, "yhat"].iloc[0])
+        st.metric(f"Predicted Enrollments – {pd.to_datetime(target_sem).strftime('%b %Y')}", target_val)
+
+        st.subheader("Next 4 Semesters")
+        next4 = future_only.head(4).copy()
+        next4_disp = (next4.assign(Semester=next4["sem_date"].dt.strftime("%b %Y"))
+                             [["Semester", "yhat"]]
+                             .rename(columns={"yhat": "Predicted Enrollments"}))
+        st.dataframe(next4_disp, use_container_width=True, hide_index=True)
+    else:
+        st.info("No future forecast rows found.")
+
+# ===== TAB 2: COR =====
+with tab2:
+    st.caption("Forecasted enrollments by Country of Residence (deduplicated & standardized).")
+    future_sems = sorted(cor["sem_date"].unique())
+    if future_sems:
+        sem_sel = st.selectbox(
+            "Select a future semester",
+            future_sems,
+            format_func=lambda d: pd.to_datetime(d).strftime("%b %Y"),
+        )
+        cor_sub = cor[cor["sem_date"] == sem_sel].sort_values("pred_count", ascending=False)
+
+        fig2 = px.bar(
+            cor_sub,
+            x="pred_count", y="Country",
+            orientation="h",
+            title=f"Future COR Breakdown – {pd.to_datetime(sem_sel).strftime('%b %Y')}",
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+
+        tbl = (cor_sub.assign(Semester=pd.to_datetime(sem_sel).strftime("%b %Y"))
+                        [["Semester", "Country", "pred_count"]]
+                        .rename(columns={"pred_count": "Predicted Enrollments"}))
+        st.dataframe(tbl, use_container_width=True, hide_index=True)
+    else:
+        st.info("No COR forecast data found.")
+
+st.caption("Note: Headline total reads the raw Excel (e.g., 425) while charts use semestered time-series data.")
+
