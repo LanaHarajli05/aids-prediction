@@ -1,4 +1,4 @@
-# app.py — AI & DS: EDA & Forecast Dashboard (PII redacted, no captions)
+# app.py — AI & DS: EDA & Forecast Dashboard (Unnamed cols hidden, PII redacted, total=Count max)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -71,16 +71,15 @@ def std_country(series: pd.Series) -> pd.Series:
         "QATAR": "Qatar", "KUWAIT": "Kuwait",
         "USA": "USA", "UNITED STATES": "USA",
     }
-    out = s.map(mapping).fillna(s.str.title())
-    return out
+    return s.map(mapping).fillna(s.str.title())
 
-# --- adjust semester display months (Fall→Aug, Spring→Jan) ---
+# --- display mapping: Fall→Aug 1, Spring→Jan 1
 def adjust_sem_month(dt: pd.Timestamp) -> pd.Timestamp:
     if pd.isna(dt): return dt
     y, m = dt.year, dt.month
-    if m == 10:  # Fall -> August of same year
+    if m == 10:  # Fall encoded as Oct -> show Aug
         return pd.Timestamp(y, 8, 1)
-    if m == 3:   # Spring -> January of same year
+    if m == 3:   # Spring encoded as Mar -> show Jan
         return pd.Timestamp(y, 1, 1)
     return dt
 
@@ -89,7 +88,7 @@ def apply_sem_adjustment(df: pd.DataFrame) -> pd.DataFrame:
     df["sem_date"] = df["sem_date"].map(adjust_sem_month)
     return df
 
-# ---------- load data (root) ----------
+# ---------- load CSV artifacts ----------
 actual_path = BASE / "actual_enrollments.csv"
 cor_path    = BASE / "forecast_cor.csv"
 fc_path, fc_kind = pick_forecast_file()
@@ -98,12 +97,12 @@ actual = read_csv_safe(actual_path)
 fc     = read_csv_safe(fc_path)
 cor    = read_csv_safe(cor_path)
 
-# actuals: standardize, adjust months, sort
+# actuals
 actual = coerce_sem_date(actual)
 actual = ensure_columns(actual, {"enrollments": ["count", "total", "Enrollments"]})
 actual = apply_sem_adjustment(actual).sort_values("sem_date")[["sem_date","enrollments"]]
 
-# forecast: standardize, rename yhat, adjust months, sort
+# forecast
 fc = coerce_sem_date(fc)
 if fc_kind == "prophet":
     if "yhat" not in fc.columns and "pred_total" in fc.columns: fc = fc.rename(columns={"pred_total": "yhat"})
@@ -117,7 +116,7 @@ if "yhat_lower" not in fc.columns: fc["yhat_lower"] = np.nan
 if "yhat_upper" not in fc.columns: fc["yhat_upper"] = np.nan
 fc = apply_sem_adjustment(fc).sort_values("sem_date")[["sem_date","yhat","yhat_lower","yhat_upper"]]
 
-# COR forecast: standardize, adjust months, deduplicate per semester+country
+# COR
 cor = coerce_sem_date(cor)
 country_col = detect_country_col(cor)
 if "pred_count" not in cor.columns:
@@ -127,24 +126,39 @@ if "pred_count" not in cor.columns:
     else:
         st.error("COR CSV missing 'pred_count' (and cannot compute from 'pred_total' * 'prop').")
         st.stop()
-cor = apply_sem_adjustment(cor)
 cor["Country"] = std_country(cor[country_col])
+cor = apply_sem_adjustment(cor)
+cor["pred_count"] = pd.to_numeric(cor["pred_count"], errors="coerce").fillna(0).astype(int)
 cor = (cor.groupby(["sem_date","Country"], as_index=False)["pred_count"]
          .sum()
          .sort_values(["sem_date","pred_count"], ascending=[True, False]))
 
-# headline total from the raw Excel (prefer sheet 'All Enrolled (2)')
+# ---------- load Excel for EDA & headline total ----------
 excel_file = BASE / "AI & DS Enrolled Students Course .xlsx"
-true_total = None
 raw_df = pd.DataFrame()
+true_total = None
+
 if excel_file.exists():
     try:
         try:
             raw_df = pd.read_excel(excel_file, sheet_name="All Enrolled (2)")
         except Exception:
-            # fallback to original sheet name if needed
             raw_df = pd.read_excel(excel_file, sheet_name="All Enrolled")
-        true_total = int(len(raw_df))
+        # drop Unnamed before anything else
+        raw_df = raw_df.loc[:, ~raw_df.columns.str.startswith("Unnamed:")]
+        # compute true_total
+        if "Count" in raw_df.columns:
+            count_series = pd.to_numeric(raw_df["Count"], errors="coerce")
+            if count_series.notna().any():
+                true_total = int(count_series.max())  # -> 425 for your sheet
+        if true_total is None:
+            # fallback: count rows that have any non-null in a few identity columns
+            cols_for_presence = [c for c in ["Gender","COR","Age","University","Major","Degree Type"] if c in raw_df.columns]
+            if cols_for_presence:
+                mask = raw_df[cols_for_presence].notna().any(axis=1)
+                true_total = int(mask.sum())
+            else:
+                true_total = int(len(raw_df))
     except Exception:
         true_total = None
 
@@ -153,14 +167,14 @@ def redact_pii(df: pd.DataFrame) -> pd.DataFrame:
     drop_cols = []
     for c in df.columns:
         lc = c.lower()
-        # drop person name fields but keep 'Name of University'
-        if ("full" in lc and "name" in lc) or ("first" in lc and "name" in lc) or ("last" in lc and "name" in lc) or re.fullmatch(r"\s*name\s*", lc):
-            if "university" not in lc:
-                drop_cols.append(c)
-                continue
+        # keep "Name of University", drop other name-like columns
+        if ("name" in lc and "university" not in lc) and any(k in lc for k in ["name", "full"]):
+            drop_cols.append(c); continue
         if any(k in lc for k in ["email", "phone", "mobile", "whatsapp"]):
             drop_cols.append(c)
-    return df.drop(columns=drop_cols, errors="ignore")
+    # also ensure all Unnamed are hidden (if any slipped through)
+    drop_cols.extend([c for c in df.columns if c.startswith("Unnamed:")])
+    return df.drop(columns=list(set(drop_cols)), errors="ignore")
 
 # ---------- UI ----------
 tab_eda, tab1, tab2 = st.tabs(["EDA", "Enrollments Forecast", "COR Forecast"])
@@ -168,24 +182,28 @@ tab_eda, tab1, tab2 = st.tabs(["EDA", "Enrollments Forecast", "COR Forecast"])
 # ===== TAB: EDA =====
 with tab_eda:
     st.subheader("Exploratory Data Analysis (AI & DS)")
+
     if raw_df.empty:
         st.warning("Raw Excel not found in repo root or sheet name mismatch (expected 'All Enrolled (2)').")
     else:
-        # 1) Preview first (PII redacted)
+        # 1) Preview FIRST (PII & Unnamed hidden)
         st.dataframe(redact_pii(raw_df.copy()).head(50), use_container_width=True)
 
-        # 2) High-level overview
-        c1, c2 = st.columns(2)
+        # 2) Overview KPIs
+        c1, c2, c3 = st.columns(3)
         c1.metric("Rows", f"{len(raw_df):,}")
         c2.metric("Columns", f"{raw_df.shape[1]:,}")
+        c3.metric("Total Enrollments", f"{true_total:,}" if true_total is not None else "—")
 
-        # 3) Demographics snapshot (exclude English test fields if present)
+        # 3) Demographics snapshot (exclude English test fields; ignore Unnamed)
         demo_pool = []
         for c in raw_df.columns:
+            if c.startswith("Unnamed:"):  # hide from options
+                continue
             lc = c.lower()
             if any(k in lc for k in ["gender","age","job","occupation","degree","education","major","country","city","cohort","admit"]):
-                demo_pool.append(c)
-        demo_pool = [c for c in demo_pool if not ("english" in c.lower() and "test" in c.lower())]
+                if not ("english" in lc and "test" in lc):
+                    demo_pool.append(c)
 
         st.markdown("### Demographics at a Glance")
         default_demo = [c for c in demo_pool if any(k in c.lower() for k in ["gender","age","degree","country"])][:5]
@@ -197,7 +215,7 @@ with tab_eda:
 
         for col in demo_cols:
             series = raw_df[col].astype(str).str.strip()
-            series = series.replace({"nan": np.nan}).dropna()
+            series = series.replace({"nan": np.nan, "None": np.nan}).dropna()
             vc = series.value_counts().head(15)
             if vc.empty:
                 continue
@@ -207,11 +225,10 @@ with tab_eda:
                 fig = px.bar(vc[::-1], orientation="h", title=f"Top values — {col}")
             st.plotly_chart(fig, use_container_width=True)
 
-        # 4) Cohort timeline (map Admit/Cohort to dates: Fall→Aug 1, Spring→Jan 1, Summer→Jul 1)
+        # 4) Cohort/Admit timeline (Fall→Aug, Spring→Jan, Summer→Jul)
         def clean_cohort_text(s):
             if pd.isna(s): return s
-            s = str(s).strip()
-            s = s.replace(" -", "-").replace("- ", "-")
+            s = str(s).strip().replace(" -", "-").replace("- ", "-")
             return s
         def cohort_to_date(cohort):
             if pd.isna(cohort): return pd.NaT
@@ -225,7 +242,6 @@ with tab_eda:
             if season == "Summer": return pd.Timestamp(y2, 7, 1)
             return pd.NaT
 
-        # try typical cohort/admit columns
         coh_col = next((c for c in raw_df.columns if "cohort" in c.lower() or ("admit" in c.lower() and "semester" in c.lower())), None)
         if coh_col:
             tmp = raw_df.copy()
@@ -238,9 +254,9 @@ with tab_eda:
                 fig_ts = px.line(ts, x="sem_date", y="enrollments", markers=True, title="Enrollments by Cohort")
                 st.plotly_chart(fig_ts, use_container_width=True)
 
-# ===== TAB 1: Enrollments (unchanged visuals) =====
+# ===== TAB 1: Enrollments Forecast (unchanged) =====
 with tab1:
-    st.metric("Actual Total Enrollments", int(true_total) if true_total else int(actual["enrollments"].sum()))
+    st.metric("Actual Total Enrollments", int(true_total) if true_total is not None else int(actual["enrollments"].sum()))
 
     plot_df = pd.concat([
         actual.rename(columns={"enrollments":"value"}).assign(kind="Actual")[["sem_date","value","kind"]],
@@ -284,7 +300,7 @@ with tab1:
     else:
         st.info("No future forecast rows found.")
 
-# ===== TAB 2: COR (unchanged visuals, no captions) =====
+# ===== TAB 2: COR Forecast (unchanged visuals) =====
 with tab2:
     future_sems = sorted(cor["sem_date"].unique())
     if future_sems:
