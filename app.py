@@ -140,6 +140,7 @@ true_total = None
 
 if excel_file.exists():
     try:
+        # try preferred sheet, else fallback
         try:
             raw_df = pd.read_excel(excel_file, sheet_name="All Enrolled (2)")
         except Exception:
@@ -150,9 +151,9 @@ if excel_file.exists():
         if "Count" in raw_df.columns:
             count_series = pd.to_numeric(raw_df["Count"], errors="coerce")
             if count_series.notna().any():
-                true_total = int(count_series.max())  # -> 425 for your sheet
+                true_total = int(count_series.max())  # e.g., 425 for your sheet
         if true_total is None:
-            # fallback: count rows that have any non-null in a few identity columns
+            # fallback: rows with any non-null in a few identity columns
             cols_for_presence = [c for c in ["Gender","COR","Age","University","Major","Degree Type"] if c in raw_df.columns]
             if cols_for_presence:
                 mask = raw_df[cols_for_presence].notna().any(axis=1)
@@ -160,7 +161,8 @@ if excel_file.exists():
             else:
                 true_total = int(len(raw_df))
     except Exception:
-        true_total = None
+        # keep raw_df empty / true_total None if Excel read fails
+        pass
 
 # ---- PII redaction for preview ----
 def redact_pii(df: pd.DataFrame) -> pd.DataFrame:
@@ -179,14 +181,14 @@ def redact_pii(df: pd.DataFrame) -> pd.DataFrame:
 # ---------- UI ----------
 tab_eda, tab1, tab2 = st.tabs(["EDA", "Enrollments Forecast", "COR Forecast"])
 
-# ===== TAB: EDA =====
+# ===== TAB: EDA (Minimal: snapshot + total-enrollments curve only) =====
 with tab_eda:
-    st.subheader("Exploratory Data Analysis (AI & DS)")
+    st.subheader("Exploratory Data Analysis (AI & DS) — Minimal")
 
+    # 1) Snapshot preview (PII & Unnamed hidden)
     if raw_df.empty:
-        st.warning("Raw Excel not found in repo root or sheet name mismatch (expected 'All Enrolled (2)').")
+        st.warning("Raw Excel not found in repo root or sheet name mismatch (expected 'All Enrolled (2)' or 'All Enrolled').")
     else:
-        # 1) Preview FIRST (PII & Unnamed hidden)
         st.dataframe(redact_pii(raw_df.copy()).head(50), use_container_width=True)
 
         # 2) Overview KPIs
@@ -195,66 +197,36 @@ with tab_eda:
         c2.metric("Columns", f"{raw_df.shape[1]:,}")
         c3.metric("Total Enrollments", f"{true_total:,}" if true_total is not None else "—")
 
-        # 3) Demographics snapshot (exclude English test fields; ignore Unnamed)
-        demo_pool = []
-        for c in raw_df.columns:
-            if c.startswith("Unnamed:"):  # hide from options
-                continue
-            lc = c.lower()
-            if any(k in lc for k in ["gender","age","job","occupation","degree","education","major","country","city","cohort","admit"]):
-                if not ("english" in lc and "test" in lc):
-                    demo_pool.append(c)
+    st.divider()
 
-        st.markdown("### Demographics at a Glance")
-        default_demo = [c for c in demo_pool if any(k in c.lower() for k in ["gender","age","degree","country"])][:5]
-        demo_cols = st.multiselect(
-            "Pick demographic columns to summarize",
-            sorted(set(demo_pool)),
-            default=default_demo
+    # 3) Total enrollments over time (from actual_enrollments.csv)
+    st.subheader("Total enrollments over time")
+    if actual is not None and not actual.empty:
+        show_ma2 = st.toggle("Show 3-month moving average", value=False)
+        dfa = actual.sort_values("sem_date").copy()
+
+        fig2 = px.line(
+            dfa, x="sem_date", y="enrollments",
+            markers=True, title=None
         )
+        if show_ma2 and len(dfa) >= 2:
+            dfa["MA3"] = dfa["enrollments"].rolling(3, min_periods=1).mean()
+            fig2.add_scatter(x=dfa["sem_date"], y=dfa["MA3"], mode="lines", name="MA3")
 
-        for col in demo_cols:
-            series = raw_df[col].astype(str).str.strip()
-            series = series.replace({"nan": np.nan, "None": np.nan}).dropna()
-            vc = series.value_counts().head(15)
-            if vc.empty:
-                continue
-            if "gender" in col.lower():
-                fig = px.pie(names=vc.index, values=vc.values, title=f"Distribution — {col}")
-            else:
-                fig = px.bar(vc[::-1], orientation="h", title=f"Top values — {col}")
-            st.plotly_chart(fig, use_container_width=True)
+        fig2.update_layout(
+            xaxis_title="Semester",
+            yaxis_title="Enrollments",
+            legend_title=None,
+            margin=dict(l=10, r=10, t=10, b=10)
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+        st.caption("Business alignment: Fall ≈ August, Spring ≈ January (marketing windows).")
+    else:
+        st.info("`actual_enrollments.csv` not found or empty — cannot draw the timeline.")
 
-        # 4) Cohort/Admit timeline (Fall→Aug, Spring→Jan, Summer→Jul)
-        def clean_cohort_text(s):
-            if pd.isna(s): return s
-            s = str(s).strip().replace(" -", "-").replace("- ", "-")
-            return s
-        def cohort_to_date(cohort):
-            if pd.isna(cohort): return pd.NaT
-            txt = str(cohort).strip()
-            m = re.match(r'^(Fall|Spring|Summer)\s+(\d{2})-(\d{2})$', txt)
-            if not m: return pd.NaT
-            season, y1, y2 = m.groups()
-            y1, y2 = 2000 + int(y1), 2000 + int(y2)
-            if season == "Fall":   return pd.Timestamp(y1, 8, 1)
-            if season == "Spring": return pd.Timestamp(y2, 1, 1)
-            if season == "Summer": return pd.Timestamp(y2, 7, 1)
-            return pd.NaT
+    st.caption("Note: This EDA tab intentionally avoids detailed visuals to prevent duplication with Power BI.")
 
-        coh_col = next((c for c in raw_df.columns if "cohort" in c.lower() or ("admit" in c.lower() and "semester" in c.lower())), None)
-        if coh_col:
-            tmp = raw_df.copy()
-            tmp["Cohort_clean"] = tmp[coh_col].map(clean_cohort_text)
-            tmp["sem_date"] = tmp["Cohort_clean"].map(cohort_to_date)
-            ts = (tmp.dropna(subset=["sem_date"])
-                    .groupby("sem_date").size().rename("enrollments")
-                    .reset_index().sort_values("sem_date"))
-            if not ts.empty:
-                fig_ts = px.line(ts, x="sem_date", y="enrollments", markers=True, title="Enrollments by Cohort")
-                st.plotly_chart(fig_ts, use_container_width=True)
-
-# ===== TAB 1: Enrollments Forecast (unchanged) =====
+# ===== TAB 1: Enrollments Forecast (unchanged visuals) =====
 with tab1:
     st.metric("Actual Total Enrollments", int(true_total) if true_total is not None else int(actual["enrollments"].sum()))
 
