@@ -181,9 +181,9 @@ def redact_pii(df: pd.DataFrame) -> pd.DataFrame:
 # ---------- UI ----------
 tab_eda, tab1, tab2 = st.tabs(["EDA", "Enrollments Forecast", "COR Forecast"])
 
-# ===== TAB: EDA (Minimal: snapshot + total-enrollments curve only) =====
+# ===== TAB: EDA (Snapshot + total-enrollments curve; NO MA3) =====
 with tab_eda:
-    st.subheader("Exploratory Data Analysis (AI & DS) — Minimal")
+    st.subheader("Exploratory Data Analysis (AI & DS)")
 
     # 1) Snapshot preview (PII & Unnamed hidden)
     if raw_df.empty:
@@ -199,20 +199,14 @@ with tab_eda:
 
     st.divider()
 
-    # 3) Total enrollments over time (from actual_enrollments.csv)
+    # 3) Total enrollments over time (from actual_enrollments.csv) — only teal line
     st.subheader("Total enrollments over time")
     if actual is not None and not actual.empty:
-        show_ma2 = st.toggle("Show 3-month moving average", value=False)
         dfa = actual.sort_values("sem_date").copy()
-
         fig2 = px.line(
             dfa, x="sem_date", y="enrollments",
             markers=True, title=None
         )
-        if show_ma2 and len(dfa) >= 2:
-            dfa["MA3"] = dfa["enrollments"].rolling(3, min_periods=1).mean()
-            fig2.add_scatter(x=dfa["sem_date"], y=dfa["MA3"], mode="lines", name="MA3")
-
         fig2.update_layout(
             xaxis_title="Semester",
             yaxis_title="Enrollments",
